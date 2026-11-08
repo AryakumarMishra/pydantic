@@ -199,9 +199,32 @@ where
     }
 
     fn serialize_bytes(self, value: &[u8]) -> Result<()> {
-        self.formatter
-            .write_byte_array(&mut self.writer, value)
-            .map_err(|e| PythonSerializerError { message: e.to_string() })
+        // The only caller of this method is `RawJsonEscaped` (see `shared.rs`), passing
+        // pre-escaped JSON string content (quotes/backslashes/control characters escaped
+        // manually, and lone surrogates escaped like `\udcff`) that cannot go through
+        // `serialize_str`, as the standard escaping would escape the backslashes a second
+        // time. Python `bytes` are never serialized through this method; they are converted
+        // to a string by `BytesMode` first (see `config.rs`).
+        //
+        // The remaining non-ASCII characters in the content are written through
+        // `write_string_fragment`, so that they are still escaped for `ensure_ascii = true`.
+        tri!(
+            self.writer
+                .write_all(b"\"")
+                .map_err(|e| PythonSerializerError { message: e.to_string() })
+        );
+        let content = std::str::from_utf8(value).map_err(|e| PythonSerializerError { message: e.to_string() })?;
+        tri!(
+            self.formatter
+                .write_string_fragment(&mut self.writer, content)
+                .map_err(|e| PythonSerializerError { message: e.to_string() })
+        );
+        tri!(
+            self.writer
+                .write_all(b"\"")
+                .map_err(|e| PythonSerializerError { message: e.to_string() })
+        );
+        Ok(())
     }
 
     fn serialize_none(self) -> Result<Self::Ok> {

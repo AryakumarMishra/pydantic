@@ -1,4 +1,5 @@
 import json
+import os
 from enum import Enum
 
 import pytest
@@ -54,6 +55,53 @@ def test_str():
 def test_str_ensure_ascii(input: str, expected: str) -> None:
     v = SchemaSerializer(core_schema.str_schema())
     assert v.to_json(input, ensure_ascii=True).decode('utf-8') == expected
+
+
+def test_str_lone_surrogate():
+    # https://github.com/pydantic/pydantic/issues/14245
+    v = SchemaSerializer(core_schema.str_schema())
+    value = '\udcff'
+
+    # lone surrogates are escaped the same way as `json.dumps` does, in both ascii modes
+    assert v.to_json(value) == b'"\\udcff"'
+    assert v.to_json(value, ensure_ascii=True) == b'"\\udcff"'
+    assert json.loads(v.to_json(value)) == value
+
+    # also works nested in containers
+    v_list = SchemaSerializer(core_schema.list_schema(core_schema.str_schema()))
+    assert v_list.to_json(['a\udc80', 'ok']) == b'["a\\udc80","ok"]'
+    assert v_list.to_json(['a\udc80', 'ok'], ensure_ascii=True) == b'["a\\udc80","ok"]'
+
+    # ...and with indentation
+    assert v.to_json(value, indent=2, ensure_ascii=True) == b'"\\udcff"'
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        '\udcff',
+        'caf\udcff.txt',
+        'a\ud801b\udc02c',
+        '\udcffé\udcff😀',
+        '"\\ in\udcff\n\t\udcff"',
+        'ünïçödé\udcff',
+    ],
+)
+def test_str_lone_surrogate_matches_json_dumps(value: str) -> None:
+    v = SchemaSerializer(core_schema.str_schema())
+    assert v.to_json(value, ensure_ascii=True) == json.dumps(value, ensure_ascii=True).encode()
+
+
+def test_str_lone_surrogate_surrogateescape():
+    # lone surrogates occur naturally on Linux, where filesystem paths with
+    # non-UTF-8 bytes are decoded with `surrogateescape` (PEP 383)
+    filename = os.fsdecode(b'caf\xff.txt')
+    assert filename == 'caf\udcff.txt'
+
+    v = SchemaSerializer(core_schema.str_schema())
+    parsed = json.loads(v.to_json(filename))
+    assert parsed == filename
+    assert os.fsencode(parsed) == b'caf\xff.txt'
 
 
 def test_huge_str():

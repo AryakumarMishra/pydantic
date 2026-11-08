@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::pybacked::PyBackedStr;
-use pyo3::types::{PyDict, PyString};
+use pyo3::types::{PyBytes, PyDict, PyString};
 use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3::{PyTraverseError, PyVisit, intern};
 
@@ -535,6 +535,104 @@ impl Formatter for EscapeNonAsciiFormatter {
     }
 }
 
+/// JSON string content which is already fully escaped (quotes, backslashes and control
+/// characters), e.g. containing lone surrogate escapes like `\udcff`. It can't go through
+/// `serialize_str`, as the normal escaping would escape the backslashes a second time.
+pub(crate) struct RawJsonEscaped(Vec<u8>);
+
+impl Serialize for RawJsonEscaped {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // `PythonSerializer::serialize_bytes` writes the bytes verbatim, surrounded by
+        // quotes (see `ser.rs`). Python `bytes` never reach this method.
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl RawJsonEscaped {
+    /// Escape a Python string to JSON string content bytes, escaping lone surrogates like
+    /// `\udcXX`, the same way as Python's `json.dumps` does.
+    ///
+    /// This is only intended for strings which can't be converted to Rust `&str`, i.e.
+    /// strings containing lone surrogates — e.g. paths decoded with `surrogateescape`.
+    ///
+    /// The output contains no surrounding quotes, but otherwise the *full* escaping
+    /// (quotes, backslashes, control characters) is performed, with non-ASCII characters
+    /// left as-is; they are handled by the `Formatter` when the content is written
+    /// (e.g. escaped for `ensure_ascii = true`).
+    fn new(py_str: &Bound<'_, PyString>) -> PyResult<Self> {
+        const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+        let encoded = {
+            let ptr = unsafe {
+                pyo3::ffi::PyUnicode_AsEncodedString(py_str.as_ptr(), c"utf-8".as_ptr(), c"surrogatepass".as_ptr())
+            };
+            let bound = unsafe { Bound::from_owned_ptr_or_err(py_str.py(), ptr)? };
+            bound.cast::<PyBytes>()?.as_bytes().to_vec()
+        };
+
+        let mut out = Vec::with_capacity(encoded.len());
+        let mut i = 0;
+        while i < encoded.len() {
+            match encoded[i] {
+                b'\\' => {
+                    out.extend_from_slice(b"\\\\");
+                    i += 1;
+                }
+                b'"' => {
+                    out.extend_from_slice(b"\\\"");
+                    i += 1;
+                }
+                b'\x08' => {
+                    out.extend_from_slice(b"\\b");
+                    i += 1;
+                }
+                b'\x09' => {
+                    out.extend_from_slice(b"\\t");
+                    i += 1;
+                }
+                b'\x0A' => {
+                    out.extend_from_slice(b"\\n");
+                    i += 1;
+                }
+                b'\x0C' => {
+                    out.extend_from_slice(b"\\f");
+                    i += 1;
+                }
+                b'\x0D' => {
+                    out.extend_from_slice(b"\\r");
+                    i += 1;
+                }
+                b if b < 0x20 => {
+                    // other control characters, e.g. `\u0007`
+                    out.extend_from_slice(b"\\u00");
+                    out.push(HEX_DIGITS[(b >> 4) as usize]);
+                    out.push(HEX_DIGITS[(b & 0x0F) as usize]);
+                    i += 1;
+                }
+                // lone surrogate, encoded by `surrogatepass` as `ED Bx xx`
+                0xED if encoded.len() >= i + 3
+                    && (0xA0..=0xBF).contains(&encoded[i + 1])
+                    && (0x80..=0xBF).contains(&encoded[i + 2]) =>
+                {
+                    let codepoint =
+                        0xD800u32 + (u32::from(encoded[i + 1] - 0xA0) << 6) + u32::from(encoded[i + 2] - 0x80);
+                    out.extend_from_slice(b"\\u");
+                    out.extend_from_slice(format!("{codepoint:04x}").as_bytes());
+                    i += 3;
+                }
+                _ => {
+                    // ASCII characters above `0x1F` (including `\u007F`/DEL, which serde_json
+                    // leaves as-is) and all non-surrogate multi-byte characters, written raw
+                    out.push(encoded[i]);
+                    i += 1;
+                }
+            }
+        }
+
+        Ok(Self(out))
+    }
+}
+
 struct EscapeNonAsciiPrettyFormatter<'a> {
     pretty: PrettyFormatter<'a>,
     escape_non_ascii: EscapeNonAsciiFormatter,
@@ -795,8 +893,18 @@ impl<S: Serializer> DoSerialize for SerializeToJson<S> {
     }
 
     fn serialize_str(self, value: &Bound<'_, PyString>) -> Result<S::Ok, WrappedSerError<S::Error>> {
-        let s = value.to_str()?;
-        self.serializer.serialize_str(s).map_err(WrappedSerError)
+        match value.to_str() {
+            Ok(s) => self.serializer.serialize_str(s).map_err(WrappedSerError),
+            Err(_) => {
+                // the string contains lone surrogates (e.g. produced by `surrogateescape`
+                // for filesystem paths on Linux), which can't be represented as Rust `&str`;
+                // escape them as `\udcXX` like `json.dumps` does, and write the fully-escaped
+                // content raw
+                RawJsonEscaped::new(value)?
+                    .serialize(self.serializer)
+                    .map_err(WrappedSerError)
+            }
+        }
     }
 
     type Map = SerdeMapSerializer<S>;
